@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sas_lexer  # This is the critical Rust-based parser
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 
 # Initialize the FastAPI application
 app = FastAPI(
@@ -28,13 +30,18 @@ class SASCode(BaseModel):
     """Pydantic model for the incoming SAS code string."""
     code: str
 
+class TranslationRequest(BaseModel):
+    """Request model for the /translate endpoint."""
+    tokens: List[Dict[str, Any]]  # The parsed token list from /parse
+    target_language: Optional[str] = "python"  # Options: "python", "sql"
+
 # ====================
-# BLUEPRINT GENERATION FUNCTION (ADAPTED FOR BACKEND)
+# BLUEPRINT GENERATION
 # ====================
 def generate_blueprint(serializable_tokens, raw_sas_code):
     """
     Analyze SAS tokens to create a translation blueprint.
-    ADAPTED VERSION: Works with serialized token dictionaries from sas_lexer.
+    Works with serialized token dictionaries from sas_lexer.
     """
     # Initialize counters and trackers
     analysis = {
@@ -91,28 +98,57 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
     while i < len(serializable_tokens):
         token_text = get_token_text_safe(i)
         token_type = get_token_type_safe(i)
-        
-        # Skip if no text
-        if not token_text:
+
+        # 1. IMMEDIATELY skip whitespace and comments
+        if token_type in ['WS', 'COMMENT']:
             i += 1
             continue
-        
-        # --- SKIP WHITESPACE AND COMMENTS ---
-        # token_type is now a STRING (e.g., 'WS', 'COMMENT', 'KW_DATA')
-        if token_type and (token_type == 'WS' or token_type == 'COMMENT'):
-            i += 1
-            continue
+
+        # 2. NOW, run ALL original detection logic
+        # Example: DATA step detection 
+        if token_text == 'DATA' and not analysis["in_data_step"]:
+            next_text = get_token_text_safe(i+1)
+            if next_text and next_text not in ['_NULL_', 'STEP', '='] and not next_text.startswith('('):
+                analysis["data_steps"] += 1
+                analysis["in_data_step"] = True
+                # ... KEEP ALL ORIGINAL DATA STEP LOGIC ...
+
+        # --- PROC BLOCK DETECTION ---
+        elif token_text == 'PROC':
+            print(f"  [PROC DETECTED] At token i={i}, text='{token_text}'")
+            # Find procedure name, skipping whitespace
+            proc_pos = i + 1
+            while proc_pos < len(serializable_tokens) and get_token_type_safe(proc_pos) in ['WS', 'COMMENT']:
+                proc_pos += 1
+            
+            if proc_pos < len(serializable_tokens):
+                proc_name = get_token_text_safe(proc_pos)
+                print(f"    Found proc_name='{proc_name}' at position {proc_pos}")
+                if proc_name and proc_name.isalpha():
+                    proc_name = proc_name.upper()
+                    analysis["proc_types"].add(proc_name)
+                    analysis["proc_blocks"] += 1
+                    print(f"    -> SUCCESS: Added PROC block. Total now: {analysis['proc_blocks']}")
+                    analysis["in_proc_block"] = True
+                    analysis["current_proc"] = proc_name
+                    if proc_name == 'SQL':
+                        analysis["proc_sql_blocks"] += 1
+        # --- END OF DETECTION LOGIC ---
+
+        # 3. CRITICAL: Increment i ONCE, here at the end
+        i += 1
+
         # =====================================
         
-        # --- YOUR ORIGINAL ANALYSIS LOGIC GOES HERE ---
-        # (Keep all your detection logic for DATA, PROC, etc.)
+        # --- ORIGINAL ANALYSIS LOGIC GOES HERE ---
+        # (Keep all detection logic for DATA, PROC, etc.)
         # Example: DATA step detection
         if token_text == 'DATA' and not analysis["in_data_step"]:
             next_text = get_token_text_safe(i+1)
             if next_text and next_text not in ['_NULL_', 'STEP', '='] and not next_text.startswith('('):
                 analysis["data_steps"] += 1
                 analysis["in_data_step"] = True
-                # ... rest of your DATA step logic ...
+                # ... rest of the DATA step logic ...
         
         # PROC detection, macro detection, etc.
         # ...
@@ -121,7 +157,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
         # INCREMENT INDEX (for all non-skipped tokens)
         i += 1
     
-    # --- CALCULATE COMPLEXITY SCORE (your existing code) ---
+    # --- CALCULATE COMPLEXITY SCORE (existing code) ---
     complexity_score = (
         analysis["data_steps"] * 1 +
         analysis["proc_blocks"] * 1 +
@@ -219,7 +255,7 @@ def parse_sas(sas_input: SASCode):
     Returns the lexed tokens, any errors, and the full analysis blueprint.
     """
     try:
-        # 1. Call the lexer (this part works)
+        # 1. Call the lexer
         tokens, errors, _ = sas_lexer.lex_program_from_str(sas_input.code)
         
         # 2. Convert complex Token objects AND Error objects to serializable format
@@ -287,3 +323,40 @@ def read_root():
 def health_check():
     """Explicit health check for monitoring."""
     return {"status": "healthy"}
+
+ # --- Add the New Endpoint ---
+@app.post("/translate")
+async def create_translation(request: TranslationRequest):
+    """
+    Generate a translation from SAS tokens to the target language.
+    """
+    tokens = request.tokens
+    target = request.target_language
+
+    # 1. LOGGING (Very useful for debugging)
+    print(f"[INFO] /translate called. Tokens: {len(tokens)}, Target: {target}")
+
+    # 2. TODO: INTEGRATE YOUR LEGACY TRANSLATION LOGIC HERE
+    # ======================================================
+    # This is the critical step. You will call your actual conversion function.
+    # For now, we create a structured placeholder.
+    # translated_code = your_actual_conversion_function(tokens, target)
+    # ======================================================
+
+    # Placeholder logic demonstrating structure
+    translated_code_placeholder = f"""# SAS to {target.capitalize()} Translation (Placeholder)
+# Analysis based on {len(tokens)} parsed tokens.
+
+# DATA step and PROC logic would be converted here.
+print("Translation engine ready. Integrate conversion function.")"""
+
+    # 3. Return a structured response
+    return {
+        "success": True,
+        "target_language": target,
+        "translated_code": translated_code_placeholder,
+        "metadata": {
+            "tokens_processed": len(tokens),
+            "translation_engine": "sas-translator-v1"
+        }
+    }

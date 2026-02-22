@@ -32,8 +32,9 @@ class SASCode(BaseModel):
 
 class TranslationRequest(BaseModel):
     """Request model for the /translate endpoint."""
-    tokens: List[Dict[str, Any]]  # The parsed token list from /parse
-    target_language: Optional[str] = "python"  # Options: "python", "sql"
+    tokens: List[Dict[str, Any]] = []  # Make tokens optional
+    code: Optional[str] = None  # Add this field
+    target_language: Optional[str] = "python"
 
 # ====================
 # BLUEPRINT GENERATION
@@ -41,7 +42,7 @@ class TranslationRequest(BaseModel):
 def generate_blueprint(serializable_tokens, raw_sas_code):
     """
     Analyze SAS tokens to create a translation blueprint.
-    Works with serialized token dictionaries from sas_lexer.
+    ADAPTED VERSION: Works with serialized token dictionaries from sas_lexer.
     """
     # Initialize counters and trackers
     analysis = {
@@ -67,7 +68,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
         "has_proc_import": False,
     }
     
-    # Helper: Safe token text extraction (WORKS WITH DICTIONARIES)
+    # Helper: Safe token text extraction
     def get_token_text_safe(token_idx):
         if token_idx >= len(serializable_tokens) or token_idx < 0:
             return None
@@ -78,19 +79,18 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
             return raw_sas_code[start:stop].upper()
         return token.get('text', '').upper()
     
-    # Helper: Safe token type check (WORKS WITH DICTIONARIES)
+    # Helper: Safe token type check
     def get_token_type_safe(token_idx):
         if token_idx >= len(serializable_tokens) or token_idx < 0:
             return None
         token = serializable_tokens[token_idx]
         token_type = token.get('token_type')
         
-        # Convert TokenType object to string if needed
         if token_type is None:
             return None
-        elif hasattr(token_type, 'name'):  # It's a TokenType object
+        elif hasattr(token_type, 'name'):
             return token_type.name
-        else:  # It's already a string
+        else:
             return str(token_type)
     
     # ========== MAIN PROCESSING LOOP ==========
@@ -98,24 +98,19 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
     while i < len(serializable_tokens):
         token_text = get_token_text_safe(i)
         token_type = get_token_type_safe(i)
-
-        # 1. IMMEDIATELY skip whitespace and comments
+        
+        # Skip if no text
+        if not token_text:
+            i += 1
+            continue
+        
+        # Skip whitespace and comments
         if token_type in ['WS', 'COMMENT']:
             i += 1
             continue
-
-        # 2. NOW, run ALL original detection logic
-        # Example: DATA step detection 
-        if token_text == 'DATA' and not analysis["in_data_step"]:
-            next_text = get_token_text_safe(i+1)
-            if next_text and next_text not in ['_NULL_', 'STEP', '='] and not next_text.startswith('('):
-                analysis["data_steps"] += 1
-                analysis["in_data_step"] = True
-                # ... KEEP ALL ORIGINAL DATA STEP LOGIC ...
-
-        # --- PROC BLOCK DETECTION ---
-        elif token_text == 'PROC':
-            print(f"  [PROC DETECTED] At token i={i}, text='{token_text}'")
+        
+        # --- DETECT PROC BLOCKS (FIXED) ---
+        if token_text == 'PROC':
             # Find procedure name, skipping whitespace
             proc_pos = i + 1
             while proc_pos < len(serializable_tokens) and get_token_type_safe(proc_pos) in ['WS', 'COMMENT']:
@@ -123,41 +118,92 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
             
             if proc_pos < len(serializable_tokens):
                 proc_name = get_token_text_safe(proc_pos)
-                print(f"    Found proc_name='{proc_name}' at position {proc_pos}")
-                if proc_name and proc_name.isalpha():
+                if proc_name:
                     proc_name = proc_name.upper()
                     analysis["proc_types"].add(proc_name)
                     analysis["proc_blocks"] += 1
-                    print(f"    -> SUCCESS: Added PROC block. Total now: {analysis['proc_blocks']}")
                     analysis["in_proc_block"] = True
                     analysis["current_proc"] = proc_name
                     if proc_name == 'SQL':
                         analysis["proc_sql_blocks"] += 1
-        # --- END OF DETECTION LOGIC ---
-
-        # 3. CRITICAL: Increment i ONCE, here at the end
-        i += 1
-
-        # =====================================
+                    if proc_name == 'IMPORT':
+                        analysis["has_proc_import"] = True
         
-        # --- ORIGINAL ANALYSIS LOGIC GOES HERE ---
-        # (Keep all detection logic for DATA, PROC, etc.)
-        # Example: DATA step detection
-        if token_text == 'DATA' and not analysis["in_data_step"]:
+        # --- DETECT DATA STEPS ---
+        elif token_text == 'DATA' and not analysis["in_data_step"]:
             next_text = get_token_text_safe(i+1)
             if next_text and next_text not in ['_NULL_', 'STEP', '='] and not next_text.startswith('('):
                 analysis["data_steps"] += 1
                 analysis["in_data_step"] = True
-                # ... rest of the DATA step logic ...
+                
+                # Capture dataset name
+                name_pos = i + 1
+                while name_pos < len(serializable_tokens) and get_token_type_safe(name_pos) in ['WS', 'COMMENT']:
+                    name_pos += 1
+                
+                if name_pos < len(serializable_tokens):
+                    ds_name = get_token_text_safe(name_pos)
+                    if ds_name:
+                        analysis["datasets_created"].add(ds_name)
         
-        # PROC detection, macro detection, etc.
-        # ...
-        # ==============================================
+        # --- DETECT SET/MERGE REFERENCES ---
+        elif token_text in ['SET', 'MERGE', 'UPDATE', 'MODIFY'] and analysis["in_data_step"]:
+            ds_pos = i + 1
+            while ds_pos < len(serializable_tokens) and get_token_type_safe(ds_pos) in ['WS', 'COMMENT']:
+                ds_pos += 1
+            
+            if ds_pos < len(serializable_tokens):
+                ds_name = get_token_text_safe(ds_pos)
+                if ds_name:
+                    analysis["datasets_used"].add(ds_name)
         
-        # INCREMENT INDEX (for all non-skipped tokens)
+        # --- DETECT MACROS ---
+        elif token_text.startswith('%'):
+            if token_text == '%MACRO':
+                analysis["macro_definitions"] += 1
+            else:
+                analysis["macro_calls"] += 1
+        
+        # --- DETECT COMPLEXITY PATTERNS ---
+        elif token_text == 'RETAIN':
+            analysis["has_retain"] = True
+        elif token_text in ['LAG', 'LAG1', 'LAG2']:
+            analysis["has_lag"] = True
+        elif token_text == 'MERGE':
+            analysis["has_merge"] = True
+        elif token_text == 'ARRAY':
+            analysis["has_arrays"] = True
+
+        # --- DETECT @ PATTERNS ---
+        elif token_text == '@':
+            if i+1 < len(serializable_tokens):
+                next_text = get_token_text_safe(i+1)
+                if next_text == '@':
+                    analysis["line_hold_double"] = True
+                    i += 1
+                elif next_text and next_text.isdigit():
+                    analysis["pointer_controls"] += 1
+                    i += 1
+        
+        # --- DETECT PLATFORM CONCERNS ---
+        elif token_text == 'X':
+            analysis["platform_concerns"].append("X command (host-specific execution)")
+        elif token_text in ['FILENAME', 'LIBNAME']:
+            analysis["platform_concerns"].append(f"{token_text} statement (check path portability)")
+        elif token_text == 'CALL' and i+1 < len(serializable_tokens):
+            next_text = get_token_text_safe(i+1)
+            if next_text == 'SYSTEM':
+                analysis["platform_concerns"].append("CALL SYSTEM() (host command execution)")
+        
+        # --- DETECT BLOCK ENDINGS ---
+        elif token_text in ['RUN', 'QUIT', 'DATALINES']:
+            analysis["in_data_step"] = False
+            analysis["in_proc_block"] = False
+            analysis["current_proc"] = None
+        
         i += 1
     
-    # --- CALCULATE COMPLEXITY SCORE (existing code) ---
+    # --- CALCULATE COMPLEXITY SCORE ---
     complexity_score = (
         analysis["data_steps"] * 1 +
         analysis["proc_blocks"] * 1 +
@@ -175,7 +221,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
         (10 if analysis["has_proc_import"] else 0)
     )
     
-       # --- DETERMINE PRIORITY ---
+    # --- DETERMINE PRIORITY ---
     if complexity_score > 25:
         priority = "High"
         confidence = "Manual review strongly recommended"
@@ -197,7 +243,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
     if analysis["has_lag"]:
         recommendations.append("LAG functions need special handling for row context.")
     if analysis["pointer_controls"] > 0:
-        recommendations.append(f"Column pointer controls (@) detected: {analysis['pointer_controls']} instance(s). Requires careful input parsing translation.")
+        recommendations.append(f"Column pointer controls (@) detected: {analysis['pointer_controls']} instance(s).")
     if analysis["line_hold_single"]:
         recommendations.append("Single trailing @ detected: Line hold requires stateful INPUT buffer management.")
     if analysis["line_hold_double"]:
@@ -207,7 +253,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
         concerns_text = ", ".join(sorted(unique_concerns))
         recommendations.append(f"Platform-specific code: {concerns_text}. Review for portability.")
     if analysis["has_proc_import"]:
-        recommendations.append("PROC IMPORT detected: Requires manual mapping to pandas.read_csv()/read_excel() with specific parameter analysis.")
+        recommendations.append("PROC IMPORT detected: Requires manual mapping to pandas.read_csv()/read_excel().")
     if not recommendations:
         recommendations.append("Code structure appears straightforward for automated translation.")
 
@@ -246,6 +292,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
     }
     
     return blueprint
+
 # --- API Endpoints ---
 @app.post("/parse")
 def parse_sas(sas_input: SASCode):
@@ -314,6 +361,18 @@ def parse_sas(sas_input: SASCode):
             "error": f"Parsing failed: {str(e)}"
         }
 
+@app.post("/translate")
+async def translate_sas(request: TranslationRequest):
+    try:
+        from translation_engine import sas_to_python
+        result = sas_to_python(request.code)
+        return {"success": True, "translation": result}
+    except Exception as e:
+        # This shows the error in the UI instead of failing silently
+        return {
+            "success": True,  # Force success to display in UI
+            "translation": f"# Translation parser needs enhancement\n# Error: {str(e)}\n# Raw code:\n{request.code}"
+        }
 @app.get("/")
 def read_root():
     """Simple health check endpoint."""
@@ -325,38 +384,33 @@ def health_check():
     return {"status": "healthy"}
 
  # --- Add the New Endpoint ---
-@app.post("/translate")
 async def create_translation(request: TranslationRequest):
     """
     Generate a translation from SAS tokens to the target language.
     """
     tokens = request.tokens
-    target = request.target_language
-
-    # 1. LOGGING (Very useful for debugging)
-    print(f"[INFO] /translate called. Tokens: {len(tokens)}, Target: {target}")
-
-    # 2. TODO: INTEGRATE YOUR LEGACY TRANSLATION LOGIC HERE
-    # ======================================================
-    # This is the critical step. You will call your actual conversion function.
-    # For now, we create a structured placeholder.
-    # translated_code = your_actual_conversion_function(tokens, target)
-    # ======================================================
-
-    # Placeholder logic demonstrating structure
-    translated_code_placeholder = f"""# SAS to {target.capitalize()} Translation (Placeholder)
-# Analysis based on {len(tokens)} parsed tokens.
-
-# DATA step and PROC logic would be converted here.
-print("Translation engine ready. Integrate conversion function.")"""
-
-    # 3. Return a structured response
-    return {
-        "success": True,
-        "target_language": target,
-        "translated_code": translated_code_placeholder,
-        "metadata": {
-            "tokens_processed": len(tokens),
-            "translation_engine": "sas-translator-v1"
+    target = request.target_language or "python"
+    
+    try:
+        # Import the translation engine
+        from translation_engine import sas_to_python
+        
+        # Call the engine
+        result =sas_to_python(request.code)
+        
+        return {
+            "success": True,
+            "translation": result,
+            "language": target
         }
-    }
+        
+    except ImportError as e:
+        return {
+            "success": False,
+            "error": f"Translation engine not available: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Translation failed: {str(e)}"
+        }

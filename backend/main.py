@@ -5,9 +5,8 @@ This is the FastAPI application that provides the parsing endpoint.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import sas_lexer  # This is the critical Rust-based parser
-from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+import sas_lexer  # Rust-based parser
 
 # Initialize the FastAPI application
 app = FastAPI(
@@ -19,22 +18,22 @@ app = FastAPI(
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8050"],
+    allow_origins=["http://localhost:5000", "https://sas-translator.com"],
     allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# --- Data Model ---
+# --- Data Models ---
 class SASCode(BaseModel):
     """Pydantic model for the incoming SAS code string."""
     code: str
 
 class TranslationRequest(BaseModel):
     """Request model for the /translate endpoint."""
-    tokens: List[Dict[str, Any]] = []  # Make tokens optional
-    code: Optional[str] = None  # Add this field
+    code: str
     target_language: Optional[str] = "python"
+
 
 # ====================
 # BLUEPRINT GENERATION
@@ -42,7 +41,7 @@ class TranslationRequest(BaseModel):
 def generate_blueprint(serializable_tokens, raw_sas_code):
     """
     Analyze SAS tokens to create a translation blueprint.
-    ADAPTED VERSION: Works with serialized token dictionaries from sas_lexer.
+    Works with serialized token dictionaries from sas_lexer.
     """
     # Initialize counters and trackers
     analysis = {
@@ -109,9 +108,8 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
             i += 1
             continue
         
-        # --- DETECT PROC BLOCKS (FIXED) ---
+        # --- DETECT PROC BLOCKS ---
         if token_text == 'PROC':
-            # Find procedure name, skipping whitespace
             proc_pos = i + 1
             while proc_pos < len(serializable_tokens) and get_token_type_safe(proc_pos) in ['WS', 'COMMENT']:
                 proc_pos += 1
@@ -136,7 +134,6 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
                 analysis["data_steps"] += 1
                 analysis["in_data_step"] = True
                 
-                # Capture dataset name
                 name_pos = i + 1
                 while name_pos < len(serializable_tokens) and get_token_type_safe(name_pos) in ['WS', 'COMMENT']:
                     name_pos += 1
@@ -293,6 +290,7 @@ def generate_blueprint(serializable_tokens, raw_sas_code):
     
     return blueprint
 
+
 # --- API Endpoints ---
 @app.post("/parse")
 def parse_sas(sas_input: SASCode):
@@ -305,17 +303,18 @@ def parse_sas(sas_input: SASCode):
         # 1. Call the lexer
         tokens, errors, _ = sas_lexer.lex_program_from_str(sas_input.code)
         
-        # 2. Convert complex Token objects AND Error objects to serializable format
+        # 2. Convert complex Token objects to serializable format
         serializable_tokens = []
         if hasattr(tokens, '__iter__'):
             for token in tokens:
                 try:
                     token_dict = vars(token)
-                    filtered_dict = {k: v for k, v in token_dict.items() if isinstance(v, (str, int, float, bool, type(None)))}
+                    filtered_dict = {k: v for k, v in token_dict.items() 
+                                   if isinstance(v, (str, int, float, bool, type(None)))}
                     serializable_tokens.append(filtered_dict)
                 except TypeError:
-                    # Handle Error objects specifically
-                    if hasattr(token, 'message'):  # Likely an Error object
+                    # Handle Error objects
+                    if hasattr(token, 'message'):
                         serializable_tokens.append({
                             "type": "error",
                             "message": str(getattr(token, 'message', 'Unknown error')),
@@ -332,7 +331,7 @@ def parse_sas(sas_input: SASCode):
         else:
             serializable_tokens = str(tokens)
         
-        # 3. ALSO serialize any Error objects in the errors list
+        # 3. Serialize any Error objects in the errors list
         serializable_errors = []
         for err in errors:
             if hasattr(err, 'message'):
@@ -342,7 +341,7 @@ def parse_sas(sas_input: SASCode):
                     "repr": repr(err)
                 })
             else:
-                serializable_errors.append(str(err))  # Fallback
+                serializable_errors.append(str(err))
 
         # 4. Generate the blueprint
         blueprint = generate_blueprint(serializable_tokens, sas_input.code)
@@ -351,7 +350,7 @@ def parse_sas(sas_input: SASCode):
         return {
             "success": True,
             "tokens": serializable_tokens,
-            "errors": serializable_errors,  # CRITICAL: Use the serialized version
+            "errors": serializable_errors,
             "blueprint": blueprint
         }
     
@@ -361,56 +360,34 @@ def parse_sas(sas_input: SASCode):
             "error": f"Parsing failed: {str(e)}"
         }
 
+
 @app.post("/translate")
 async def translate_sas(request: TranslationRequest):
+    """
+    Translate SAS code to Python.
+    """
     try:
         from translation_engine import sas_to_python
         result = sas_to_python(request.code)
-        return {"success": True, "translation": result}
-    except Exception as e:
-        # This shows the error in the UI instead of failing silently
         return {
-            "success": True,  # Force success to display in UI
-            "translation": f"# Translation parser needs enhancement\n# Error: {str(e)}\n# Raw code:\n{request.code}"
+            "success": True,
+            "translation": result,
+            "language": request.target_language
         }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
 @app.get("/")
 def read_root():
     """Simple health check endpoint."""
     return {"message": "SAS Parser API is running"}
 
+
 @app.get("/health")
 def health_check():
     """Explicit health check for monitoring."""
     return {"status": "healthy"}
-
- # --- Add the New Endpoint ---
-async def create_translation(request: TranslationRequest):
-    """
-    Generate a translation from SAS tokens to the target language.
-    """
-    tokens = request.tokens
-    target = request.target_language or "python"
-    
-    try:
-        # Import the translation engine
-        from translation_engine import sas_to_python
-        
-        # Call the engine
-        result =sas_to_python(request.code)
-        
-        return {
-            "success": True,
-            "translation": result,
-            "language": target
-        }
-        
-    except ImportError as e:
-        return {
-            "success": False,
-            "error": f"Translation engine not available: {str(e)}"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Translation failed: {str(e)}"
-        }

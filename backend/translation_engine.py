@@ -2,11 +2,38 @@
 SAS to Python/SQL Translation Engine
 Converts SAS token streams to target language code.
 """
-
 import re
 from dataclasses import dataclass
 from typing import List, Union
+
 from sas_parser import lex, Parser, CodeGen
+
+
+def sas_to_python(code: str) -> str:
+    """
+    Convert SAS code to Python.
+    
+    Args:
+        code: Raw SAS code string
+        
+    Returns:
+        Python code as string
+    """
+    tokens = lex(code)
+    ast = Parser(tokens).parse()
+    return CodeGen().generate(ast)
+
+
+# Example usage (commented out for production)
+if __name__ == "__main__":
+    sas = """
+        data example;
+            set mytable;
+            x = a + b;
+            if a = 1 then y = 3*b;
+        run;
+    """
+    print(sas_to_python(sas))
 
 def sas_to_python(code: str) -> str:
     tokens = lex(code)

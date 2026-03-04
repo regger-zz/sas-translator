@@ -1,9 +1,12 @@
+"""
+SAS Parser - Converts SAS code to an Abstract Syntax Tree (AST)
+"""
 import re
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Union, Optional
 
 # ---------------------------------------------------------------------
-# TOKENS
+# TOKEN SPECIFICATION
 # ---------------------------------------------------------------------
 
 TOKEN_SPEC = [
@@ -14,39 +17,27 @@ TOKEN_SPEC = [
     ('MINUS',    r'-'),
     ('MULT',     r'\*'),
     ('DIV',      r'/'),
+    ('DOT',      r'\.'),
     ('SEMI',     r';'),
     ('LPAREN',   r'\('),
     ('RPAREN',   r'\)'),
     ('COMMA',    r','),
     ('WS',       r'\s+'),
-    ('OTHER',    r'.'),  # catch-all
+    ('OTHER',    r'.'),
 ]
 
 MASTER_REGEX = '|'.join(f'(?P<{name}>{pattern})' for name, pattern in TOKEN_SPEC)
 KEYWORDS = {'data', 'set', 'run', 'if', 'then', 'proc', 'sort', 'by', 'print', 'import', 'replace'}
 
-@dataclass
-class Token:
-    type: str
-    value: str
-
-def lex(code: str) -> List[Token]:
-    tokens = []
-    for match in re.finditer(MASTER_REGEX, code, flags=re.IGNORECASE):
-        kind = match.lastgroup
-        value = match.group()
-
-        if kind == 'WS':
-            continue
-        if kind == 'IDENT':
-            if value.lower() in KEYWORDS:
-                kind = value.lower().upper()  # keyword token type
-        tokens.append(Token(kind, value))
-    return tokens
 
 # ---------------------------------------------------------------------
 # AST NODE TYPES
 # ---------------------------------------------------------------------
+
+@dataclass
+class Token:
+    type: str
+    value: str
 
 @dataclass
 class DataStep:
@@ -71,6 +62,31 @@ class IfStatement:
 class InfileStatement:
     path: str
 
+@dataclass
+class PrintStatement:
+    dataset: Optional[str] = None
+
+
+# ---------------------------------------------------------------------
+# LEXER
+# ---------------------------------------------------------------------
+
+def lex(code: str) -> List[Token]:
+    """Convert SAS code string to a list of tokens."""
+    tokens = []
+    for match in re.finditer(MASTER_REGEX, code, flags=re.IGNORECASE):
+        kind = match.lastgroup
+        value = match.group()
+
+        if kind == 'WS':
+            continue
+        if kind == 'IDENT':
+            if value.lower() in KEYWORDS:
+                kind = value.lower().upper()
+        tokens.append(Token(kind, value))
+    return tokens
+
+
 # ---------------------------------------------------------------------
 # PARSER
 # ---------------------------------------------------------------------
@@ -92,44 +108,52 @@ class Parser:
         self.i += 1
         return tok
 
-    # ---------------------------------------------------------
-
-
     def parse(self):
+        """Parse the token stream into an AST."""
         items = []
         while self.peek():
             tok = self.peek()
             if tok.type == 'DATA':
                 items.append(self.parse_data_step())
-            elif tok.type == 'PROC': 
-                self.parse_proc()     # Skip PROC statements
+            elif tok.type == 'PROC':
+                node = self.parse_proc()
+                if node:
+                    items.append(node)
             else:
-                self.eat()  # skip unknown
+                self.eat()
         return items
 
-        # ---------------------------------------------------------
-
     def parse_data_step(self):
+        """Parse a DATA step."""
         self.eat('DATA')
-        name = self.eat('IDENT').value
+        
+        # Handle qualified dataset name (e.g., work.test)
+        parts = [self.eat('IDENT').value]
+        while self.peek() and self.peek().type == 'DOT':
+            self.eat('DOT')
+            parts.append(self.eat('IDENT').value)
+        name = '.'.join(parts)
+        
         self.eat('SEMI')
-    
+
         statements = []
         while True:
             tok = self.peek()
             if not tok or tok.type == 'RUN':
                 break
                 
-            if tok.type == 'SET':
+            if tok.type == 'SEMI':
+                self.eat('SEMI')
+            elif tok.type == 'SET':
                 statements.append(self.parse_set())
             elif tok.type == 'INFILE':
-                # Skip INFILE statement for now
+                # Skip INFILE for now
                 self.eat('INFILE')
                 while self.peek() and self.peek().type != 'SEMI':
                     self.eat()
                 self.eat('SEMI')
             elif tok.type == 'DATALINES':
-                # Skip DATALINES block
+                # Skip DATALINES for now
                 self.eat('DATALINES')
                 while self.peek() and self.peek().type != 'SEMI':
                     self.eat()
@@ -138,31 +162,6 @@ class Parser:
                 statements.append(self.parse_if())
             elif tok.type == 'IDENT':
                 statements.append(self.parse_assignment())
-            elif tok.type == 'PROC':  
-                self.eat('PROC')
-                proc_name = self.eat('IDENT').value
-
-            elif tok.type == 'PROC':
-                self.eat('PROC')
-                proc_name = self.eat('IDENT').value
-                # Skip everything until RUN or next PROC/DATA
-                while self.peek() and self.peek().type not in ['RUN', 'PROC', 'DATA']:
-                    self.eat()
-                if self.peek() and self.peek().type == 'RUN':
-                    self.eat('RUN')
-                    self.eat('SEMI')
-
-                if proc_name.upper() == 'PRINT':
-                    # Skip PROC PRINT
-                    while self.peek() and self.peek().type not in ['RUN', 'DATA', 'PROC']:
-                        self.eat()
-                    if self.peek() and self.peek().type == 'RUN':
-                        self.eat('RUN')
-                        self.eat('SEMI')
-                else:
-                    # Unknown PROC - skip it
-                    while self.peek() and self.peek().type not in ['RUN', 'DATA', 'PROC']:
-                        self.eat()
             else:
                 self.eat()
 
@@ -170,22 +169,57 @@ class Parser:
         self.eat('SEMI')
         return DataStep(name=name, statements=statements)
 
-    def parse_set(self):
-        self.eat('SET')
-        table = self.eat('IDENT').value
-        self.eat('SEMI')
-        return SetStatement(table)
-
     def parse_proc(self):
-        """Skip entire PROC statement"""
+        """Parse a PROC step."""
         self.eat('PROC')
-        while self.peek() and self.peek().type != 'RUN':
-            self.eat()
-        if self.peek() and self.peek().type == 'RUN':
-            self.eat('RUN')
-            self.eat('SEMI')
+        proc_name = self.eat('IDENT').value
+        
+        if proc_name.upper() == 'PRINT':
+            # Parse PROC PRINT
+            dataset = None
+            
+            # Parse options until RUN
+            while self.peek() and self.peek().type not in ['RUN', 'PROC']:
+                if self.peek().type == 'IDENT' and self.peek().value.upper() == 'DATA':
+                    self.eat('IDENT')  # DATA
+                    self.eat('EQ')      # =
+                    
+                    # Get dataset name (may be qualified)
+                    parts = [self.eat('IDENT').value]
+                    while self.peek() and self.peek().type == 'DOT':
+                        self.eat('DOT')
+                        parts.append(self.eat('IDENT').value)
+                    dataset = '.'.join(parts)
+                else:
+                    self.eat()
+            
+            # Consume RUN;
+            if self.peek() and self.peek().type == 'RUN':
+                self.eat('RUN')
+                self.eat('SEMI')
+            
+            return PrintStatement(dataset=dataset)
+        else:
+            # Skip other PROCs
+            while self.peek() and self.peek().type not in ['RUN', 'PROC']:
+                self.eat()
+            if self.peek() and self.peek().type == 'RUN':
+                self.eat('RUN')
+                self.eat('SEMI')
+            return None
+
+    def parse_set(self):
+        """Parse a SET statement."""
+        self.eat('SET')
+        parts = [self.eat('IDENT').value]
+        while self.peek() and self.peek().type == 'DOT':
+            self.eat('DOT')
+            parts.append(self.eat('IDENT').value)
+        self.eat('SEMI')
+        return SetStatement('.'.join(parts))
 
     def parse_assignment(self):
+        """Parse an assignment statement (e.g., x = y + z)."""
         var = self.eat('IDENT').value
         self.eat('EQ')
         expr_tokens = []
@@ -195,6 +229,7 @@ class Parser:
         return Assignment(var, ' '.join(expr_tokens))
 
     def parse_if(self):
+        """Parse an IF-THEN statement."""
         self.eat('IF')
         cond_tokens = []
         while self.peek() and self.peek().type != 'THEN':
@@ -203,27 +238,36 @@ class Parser:
         assign = self.parse_assignment()
         return IfStatement(' '.join(cond_tokens), assign)
 
-    def parse_infile(self):
-        self.eat('INFILE')
-        path = self.eat('IDENT').value  # Simplifies for now
+    def parse_assignment(self):
+        var = self.eat('IDENT').value
+        self.eat('EQ')
+        expr_tokens = []
+        while self.peek() and self.peek().type != 'SEMI':
+            # Accept any token as part of the expression
+            expr_tokens.append(self.eat().value)
         self.eat('SEMI')
-        return InfileStatement(path)
-    
+        return Assignment(var, ' '.join(expr_tokens))
 # ---------------------------------------------------------------------
-# CODE GENERATION (SAS AST → Python/Pandas)
+# CODE GENERATOR
 # ---------------------------------------------------------------------
 
 class CodeGen:
     def generate(self, ast_items):
+        """Generate Python code from AST."""
         py = ["import pandas as pd", ""]
         for item in ast_items:
             if isinstance(item, DataStep):
                 py.append(self.gen_data_step(item))
+            elif isinstance(item, PrintStatement):
+                if item.dataset:
+                    py.append(f"print({item.dataset})")
+                else:
+                    py.append("print(df)")
         return "\n".join(py)
 
     def gen_data_step(self, node: DataStep):
+        """Generate Python for a DATA step."""
         lines = [f"# DATA step {node.name}"]
-        lines.append("df = pd.DataFrame()")
         for stmt in node.statements:
             if isinstance(stmt, SetStatement):
                 lines.append(f"df = pd.read_csv('{stmt.table}.csv')")
@@ -236,35 +280,36 @@ class CodeGen:
                 )
         return "\n".join(lines)
 
-    def gen_infile(self, stmt):
-        return f"df = pd.read_csv('{stmt.path}')"
-    
     def _cond_to_mask(self, cond: str):
-        # simple "x == 1" → df['x'] == 1
-        left, op, right = cond.split()
-        return f"(df['{left}'] {op} {right})"
+        """Convert SAS condition to pandas mask."""
+        parts = cond.split()
+        if len(parts) == 3:
+            left, op, right = parts
+            return f"(df['{left}'] {op} {right})"
+        return cond
 
 
 # ---------------------------------------------------------------------
-# DRIVER
+# MAIN FUNCTION
 # ---------------------------------------------------------------------
 
-    def sas_to_python(code: str) -> str:
-        print(f"Parsing code: {repr(code[:100])}...")  # Debug
-        tokens = lex(code)
-        print(f"Tokens: {[(t.type, t.value) for t in tokens[:10]]}")  # Debug
-        ast = Parser(tokens).parse()
-        return CodeGen().generate(ast)
+def sas_to_python(code: str) -> str:
+    """Convert SAS code to Python."""
+    tokens = lex(code)
+    ast = Parser(tokens).parse()
+    return CodeGen().generate(ast)
 
 
-# Example usage:
-    if __name__ == "__main__":
-        sas = """
-            data example;
-                set mytable;
-                x = a + b;
-                if a = 1 then y = 3*b;
-            run;
-        """
-        print(sas_to_python(sas))
+# Example usage
+if __name__ == "__main__":
+    test_sas = """
+        data work.test;
+            set sashelp.class;
+            age2 = age * 2;
+        run;
+        
+        proc print data=sashelp.class;
+        run;
+    """
+    print(sas_to_python(test_sas))
 
